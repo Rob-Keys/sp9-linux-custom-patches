@@ -1,0 +1,15 @@
+[Unit]
+Description=Howdy Camera Stream Service
+After=multi-user.target
+Wants=modprobe@v4l2loopback.service
+
+[Service]
+Type=simple
+ExecStart=/home/rob-keys/Rob/sp-cam/howdy-integration/scripts/howdy/howdy-camera-stream.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

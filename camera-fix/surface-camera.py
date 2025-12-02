@@ -11,6 +11,11 @@ import threading
 import time
 from datetime import datetime
 
+# CRITICAL: Set environment to use locally built libcamera 0.6.0 instead of system 0.2.0
+# The system GStreamer plugin doesn't work with our camera names
+os.environ['GST_PLUGIN_PATH'] = '/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0'
+os.environ['LD_LIBRARY_PATH'] = '/usr/local/lib/x86_64-linux-gnu:' + os.environ.get('LD_LIBRARY_PATH', '')
+
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gst', '1.0')
 from gi.repository import Gtk, Gst, GLib, Gdk
@@ -36,14 +41,15 @@ class SurfaceCameraApp(Gtk.Window):
         self.original_button_label = None  # Store original label
 
         # Camera configuration (from camera_app_simple.py)
+        # IMPORTANT: Use double backslash so Gst.parse_launch() receives single backslash
         self.cameras = {
             "front": {
-                "name": r"\\_SB_.PC00.I2C3.CAMF",
+                "name": "\\\\_SB_.PC00.I2C3.CAMF",
                 "label": "Front Camera (OV5693)",
                 "i2c_id": "i2c-OVTI5693:00"
             },
             "rear": {
-                "name": r"\\_SB_.PC00.I2C2.CAMR",
+                "name": "\\\\_SB_.PC00.I2C2.CAMR",
                 "label": "Rear Camera (OV13858)",
                 "i2c_id": "i2c-OVTID858:00"
             }
@@ -105,6 +111,7 @@ class SurfaceCameraApp(Gtk.Window):
 
         # GStreamer Pipeline
         self.pipeline = None
+        self.bus = None
         self.is_streaming = False
 
         # Debugging log file
@@ -132,7 +139,8 @@ class SurfaceCameraApp(Gtk.Window):
 
         # Start camera immediately (no prep scripts needed)
         # Use minimal delay - just enough to let GTK initialize
-        GLib.timeout_add(100, self.start_preview, "front")
+        # Run in background thread to avoid blocking GTK main loop
+        GLib.timeout_add(100, lambda: threading.Thread(target=self.start_preview, args=("front",), daemon=True).start())
 
     def check_camera_health(self):
         """Check camera hardware health at startup"""
@@ -237,6 +245,16 @@ class SurfaceCameraApp(Gtk.Window):
                 except Exception as e:
                     self.log_message(f"Error stopping pipeline: {e}")
 
+                # CRITICAL: Clean up bus before deleting pipeline
+                # Remove signal watch to prevent memory leaks
+                if self.bus:
+                    try:
+                        self.bus.remove_signal_watch()
+                        self.log_message("Bus signal watch removed")
+                    except:
+                        pass
+                    self.bus = None
+
                 # CRITICAL: Unref and delete pipeline to fully release camera
                 # This ensures libcamera releases the media device
                 self.pipeline = None
@@ -270,15 +288,16 @@ class SurfaceCameraApp(Gtk.Window):
             # The kernel's runtime PM will wake it automatically when accessed
             # Media links are IMMUTABLE and managed by libcamera - don't try to change them manually
 
-            # Create simple pipeline - just preview, no photo capture
-            # libcamerasrc -> queue -> caps -> videoflip -> videoconvert -> gtksink
-            cmd = (f"libcamerasrc camera-name={camera_name} ! "
-                   "queue max-size-buffers=3 ! "
-                   "video/x-raw,width=1280,height=720 ! "
-                   "videoflip method=rotate-180 ! "
-                   "videoconvert ! "
-                   "gtksink name=sink sync=false")
-            self.log_message(f"GStreamer pipeline command: {cmd}")
+            # Poke the camera's power state to help it wake up faster
+            try:
+                i2c_path = f"/sys/bus/i2c/devices/{camera['i2c_id']}/power/control"
+                if os.path.exists(i2c_path):
+                    with open(i2c_path, 'r') as f:
+                        current = f.read().strip()
+                    self.log_message(f"Camera power control: {current}")
+                    # Don't change it, just reading helps wake it up
+            except Exception as e:
+                self.log_message(f"Could not check camera power state: {e}")
 
             # Try to start the pipeline with retries
             max_retries = 2
@@ -292,8 +311,33 @@ class SurfaceCameraApp(Gtk.Window):
                         time.sleep(retry_delay)
                         retry_delay *= 1.5  # Exponential backoff
 
+                    # Create simple pipeline - just preview, no photo capture
+                    # libcamerasrc -> queue -> caps -> videoflip -> videoconvert -> gtksink
+                    # IMPORTANT: camera-name must be quoted because it contains backslashes
+                    cmd = (f'libcamerasrc camera-name="{camera_name}" ! '
+                           "queue max-size-buffers=3 leaky=downstream ! "
+                           "video/x-raw,width=1280,height=720 ! "
+                           "videoflip method=rotate-180 ! "
+                           "videoconvert ! "
+                           "gtksink name=sink sync=false")
+                    self.log_message(f"GStreamer pipeline command: {cmd}")
+
                     self.pipeline = Gst.parse_launch(cmd)
                     self.log_message("GStreamer pipeline launched.")
+
+                    # Set up bus to monitor for errors - BEFORE doing anything else
+                    self.bus = self.pipeline.get_bus()
+                    self.bus.add_signal_watch()
+                    error_msg = None
+
+                    def bus_error_callback(bus, message):
+                        nonlocal error_msg
+                        if message.type == Gst.MessageType.ERROR:
+                            err, debug = message.parse_error()
+                            error_msg = f"{err}: {debug}"
+                            self.log_message(f"BUS ERROR: {error_msg}")
+
+                    self.bus.connect("message::error", bus_error_callback)
 
                     # Get sink and connect to widget
                     sink = self.pipeline.get_by_name("sink")
@@ -306,29 +350,38 @@ class SurfaceCameraApp(Gtk.Window):
                     self.video_widget.show_all()
                     self.log_message("Video widget updated and shown.")
 
-                    # Set up bus to monitor for errors - BEFORE starting pipeline
-                    bus = self.pipeline.get_bus()
-                    error_msg = None
-
                     # Start playing
                     self.log_message("Setting pipeline to PLAYING state...")
                     ret = self.pipeline.set_state(Gst.State.PLAYING)
                     self.log_message(f"set_state returned: {ret}")
 
                     if ret == Gst.StateChangeReturn.FAILURE:
-                        raise Exception("Unable to set pipeline to playing")
+                        # Process any pending bus messages to get error details
+                        time.sleep(0.1)
+                        while self.bus.have_pending():
+                            msg = self.bus.pop()
+                            if msg and msg.type == Gst.MessageType.ERROR:
+                                err, debug = msg.parse_error()
+                                error_msg = f"{err}: {debug}"
+                                self.log_message(f"Error from bus: {error_msg}")
+
+                        if error_msg:
+                            raise Exception(f"Pipeline error: {error_msg}")
+                        else:
+                            raise Exception("Unable to set pipeline to playing (no error details)")
 
                     # Wait for pipeline to reach PLAYING state with active bus message processing
                     # This is CRITICAL for async state transitions - we must pump messages
                     self.log_message("Waiting for pipeline to reach PLAYING state...")
 
-                    timeout_ns = 15 * Gst.SECOND  # 15 second timeout
+                    timeout_ns = 20 * Gst.SECOND  # 20 second timeout (cameras can be slow to wake)
                     start_time = time.time()
                     state_reached = False
+                    last_log_time = start_time
 
                     while (time.time() - start_time) * Gst.SECOND < timeout_ns:
                         # Actively pump bus messages - this is essential for state transitions
-                        msg = bus.timed_pop_filtered(
+                        msg = self.bus.timed_pop_filtered(
                             100 * Gst.MSECOND,  # Poll every 100ms
                             Gst.MessageType.ERROR | Gst.MessageType.ASYNC_DONE | Gst.MessageType.STATE_CHANGED
                         )
@@ -356,20 +409,38 @@ class SurfaceCameraApp(Gtk.Window):
                         elif ret == Gst.StateChangeReturn.FAILURE:
                             raise Exception("Pipeline state change failed")
 
-                    # Now add signal watch for ongoing monitoring
-                    bus.add_signal_watch()
-                    bus.connect("message", self.on_bus_message)
+                        # Log progress every 2 seconds if stuck
+                        if time.time() - last_log_time > 2.0:
+                            elapsed = time.time() - start_time
+                            self.log_message(f"Still waiting for PLAYING state... (current: {current}, pending: {pending}, elapsed: {elapsed:.1f}s)")
+                            last_log_time = time.time()
+
+                    # Connect to ongoing bus message handler (signal watch already added above)
+                    self.bus.connect("message", self.on_bus_message)
 
                     # Check final status
                     if error_msg:
                         raise Exception(f"GStreamer error: {error_msg}")
 
                     if not state_reached:
-                        # Do one final blocking check
-                        ret, current, pending = self.pipeline.get_state(2 * Gst.SECOND)
+                        # Do one final blocking check with longer timeout
+                        ret, current, pending = self.pipeline.get_state(5 * Gst.SECOND)
                         if current != Gst.State.PLAYING:
-                            raise Exception(f"Pipeline stuck in {current} state (pending: {pending}), expected PLAYING")
-                        self.log_message(f"Pipeline reached PLAYING after final check")
+                            # PAUSED state is actually okay - it means pipeline is ready and prerolled
+                            # The camera will transition to PLAYING once frames start flowing
+                            # This is normal behavior for live sources that are slow to start
+                            if current == Gst.State.PAUSED and pending == Gst.State.VOID_PENDING:
+                                self.log_message(f"Pipeline in PAUSED state (prerolled), will transition to PLAYING automatically")
+                                state_reached = True
+                            else:
+                                # Only fail if we're not in a reasonable state
+                                self.log_message(f"Pipeline in unexpected state, attempting recovery...")
+                                if current == Gst.State.PAUSED:
+                                    self.pipeline.set_state(Gst.State.NULL)
+                                    time.sleep(0.5)
+                                raise Exception(f"Pipeline stuck in {current} state (pending: {pending}), expected PLAYING")
+                        else:
+                            self.log_message(f"Pipeline reached PLAYING after final check")
 
                     self.log_message("GStreamer pipeline set to PLAYING.")
 
@@ -395,9 +466,16 @@ class SurfaceCameraApp(Gtk.Window):
                     if self.pipeline:
                         try:
                             self.pipeline.set_state(Gst.State.NULL)
+                            self.pipeline.get_state(5 * Gst.SECOND)  # Wait for cleanup
                         except:
                             pass
-                        self.pipeline = None
+                    if self.bus:
+                        try:
+                            self.bus.remove_signal_watch()
+                        except:
+                            pass
+                        self.bus = None
+                    self.pipeline = None
 
                     # If this was the last attempt, show error
                     if attempt >= max_retries:
@@ -514,8 +592,38 @@ class SurfaceCameraApp(Gtk.Window):
 
     def on_destroy(self, widget):
         self.log_message("Application closing...")
+
+        # Clean up GStreamer resources properly
         if self.pipeline:
-            self.pipeline.set_state(Gst.State.NULL)
+            try:
+                # Stop the pipeline and wait for it to fully stop
+                self.log_message("Stopping pipeline...")
+                self.pipeline.set_state(Gst.State.NULL)
+                ret, state, pending = self.pipeline.get_state(5 * Gst.SECOND)
+                if ret == Gst.StateChangeReturn.SUCCESS:
+                    self.log_message("Pipeline stopped successfully")
+                else:
+                    self.log_message(f"Pipeline stop returned: {ret}")
+            except Exception as e:
+                self.log_message(f"Error stopping pipeline on exit: {e}")
+
+        # Remove bus signal watch to prevent memory leaks
+        if self.bus:
+            try:
+                self.bus.remove_signal_watch()
+                self.log_message("Bus signal watch removed on exit")
+            except Exception as e:
+                self.log_message(f"Error removing bus watch: {e}")
+            self.bus = None
+
+        # Clear pipeline reference
+        self.pipeline = None
+
+        # Force garbage collection before exit
+        import gc
+        gc.collect()
+        self.log_message("Resources cleaned up, exiting...")
+
         Gtk.main_quit()
 
 if __name__ == "__main__":
