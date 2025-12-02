@@ -1,0 +1,12 @@
+# Surface Pro 9 camera power management - Enable runtime PM on device add
+# Setting to 'auto' allows kernel to manage power automatically (wake on access, suspend when idle)
+ACTION=="add", SUBSYSTEM=="i2c", ATTR{name}=="i2c-OVTI5693:00", \
+  RUN+="/bin/sh -c 'echo auto > /sys/bus/i2c/devices/i2c-OVTI5693:00/power/control'"
+ACTION=="add", SUBSYSTEM=="i2c", ATTR{name}=="i2c-OVTID858:00", \
+  RUN+="/bin/sh -c 'echo auto > /sys/bus/i2c/devices/i2c-OVTID858:00/power/control'"
+
+# Grant user-level access to the power control files for runtime toggling
+SUBSYSTEM=="i2c", ATTR{name}=="i2c-OVTI5693:00", ENV{DEVTYPE}=="i2c_device", \
+  MODE="0660", GROUP="video"
+SUBSYSTEM=="i2c", ATTR{name}=="i2c-OVTID858:00", ENV{DEVTYPE}=="i2c_device", \
+  MODE="0660", GROUP="video"
